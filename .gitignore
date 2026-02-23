@@ -1,0 +1,53 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Local tool/config files (machine-specific)
+.claude/
+.direnv/
+.envrc
+.python-version
+CLAUDE.md
+
+# Logs / cluster outputs
+logs/
+*.log
+*.out
+*.err
+
+# Datatrove generated artifacts (data, checkpoints, outputs)
+datatrove_inputs/
+datatrove_checkpoints*/
+datatrove_outputs*/
+failed_samples/
+hf_cache/
+
+# Temp / scratch
+tmp/
+tmp.txt
+*.tmp
+
+# Notebook/editor runtime artifacts
+.ipynb_checkpoints/
+*.ipynb
+
+# Local planning notes
+TODO.md
+
+# Slurm / cluster submission scripts (contain secrets/env details)
+*.sbatch
+submit_*.sh
+
+# Python test/cache artifacts
+.pytest_cache/
+.mypy_cache/
+
+# OS cruft
+.DS_Store

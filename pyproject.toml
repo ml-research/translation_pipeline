@@ -1,0 +1,18 @@
+[project]
+name = "benchmark-translation"
+version = "0.1.0"
+description = "Translate HuggingFace datasets to multiple languages using vLLM"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "datasets>=4.5.0",
+    "datatrove[io,inference]>=0.1.0",
+    "vllm>=0.15.1",
+    "openai>=1.0.0",
+    "tqdm>=4.66.0",
+    "huggingface-hub>=0.20.0",
+    "pyyaml>=6.0.0",
+    "ipykernel>=7.1.0",
+    "transformers>=4.57.5",
+    "ray[default]>=2.53.0",
+]

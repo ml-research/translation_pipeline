@@ -157,6 +157,8 @@ RULER_FIELDS = ["input", "outputs"]
 
 OUTPUT_MODE_SUFFIX = "suffix"
 OUTPUT_MODE_REPLACE = "replace"
+TRANSLATION_PROFILE_DEFAULT = "default"
+TRANSLATION_PROFILE_RULER_NIAH = "ruler_niah"
 
 ROW_ID_KEYS = ("id", "_id", "qid", "doc_id", "task_id", "uuid", "index")
 
@@ -171,12 +173,34 @@ MIN_INPUT_TOKENS_FOR_RATIO = 600
 TRUNCATION_OUTPUT_FRACTION = 0.95
 TRUNCATION_MIN_OUTPUT_TOKENS = 256
 PROMPT_OVERHEAD_TOKENS = 700
+CHAT_COMPLETION_MESSAGE_WRAPPER_TOKENS = 128
 CHUNK_INPUT_FRACTION = 0.9
 STRICT_CHUNK_INPUT_FRACTION = 0.7
-AGGRESSIVE_CHUNK_INPUT_FRACTIONS = (0.5, 0.35)
-STRICT_RETRY_TEMPERATURE = 0.2
+AGGRESSIVE_CHUNK_INPUT_FRACTIONS = (0.5, 0.35, 0.25, 0.18)
+STRICT_RETRY_TEMPERATURE = 0.0
 AUTO_MAX_OUTPUT_MARGIN = 1.15
+NIAH_AUTO_MAX_OUTPUT_MARGIN = 1.20
+NIAH_CHUNK_INPUT_SCALE = 0.35
 RETRY_MAX_TOKENS_GROWTH_STEP = 0.20
+SERVER_MAX_TOKENS_RETRY_MARGIN = 128
+SHORT_INPUT_OUTPUT_BUDGET_MAX_TOKENS = 64
+SHORT_INPUT_OUTPUT_MULTIPLIER = 3.0
+SHORT_INPUT_MIN_OUTPUT_TOKENS = 32
+REPETITION_MAX_IDENTICAL_CHAR_RUN = 128
+SINGLE_MODE_RESCUE_MIN_INPUT_TOKENS = 256
+SINGLE_MODE_RESCUE_CHUNK_FRACTION = 0.65
+SINGLE_MODE_RESCUE_MIN_CHUNK_TOKENS = 256
+HF_UPLOAD_RETRY_COUNT = 4
+HF_UPLOAD_RETRY_BASE_DELAY_SECONDS = 15
+HF_UPLOAD_TRANSIENT_ERROR_SUBSTRINGS = (
+    "unexpected internal error hook: lfs-verify",
+    "lfs-verify",
+    "internal error hook",
+    "gateway timeout",
+    "temporarily unavailable",
+    "too many requests",
+    "server error",
+)
 
 EXPANSION_1_3_LANGS = {"de", "fr", "es", "it", "pt", "nl", "en"}
 EXPANSION_1_6_LANGS = {"pl", "ru", "cs", "sv", "da", "no", "ro", "bg", "uk"}
@@ -215,12 +239,18 @@ RETRY_REASON_SMALLER_CHUNKS_SUBSTRINGS = (
     "output likely clipped",
     "output hit max_tokens",
     "non-stop finish reason: length",
+    "max_completion_tokens",
+    "parameter=max_tokens",
     "structured document markers indicate missing tail content",
     "long-form input appears incompletely translated",
     "embedded qa instruction",
     "repetitive",
 )
 WORD_RE = re.compile(r"\w+", re.UNICODE)
+VLLM_MAX_TOKENS_TOO_LARGE_RE = re.compile(
+    r"maximum context length is\s*(?P<context>\d+)\s*tokens\s*and your request has\s*(?P<input>\d+)\s*input tokens",
+    re.IGNORECASE,
+)
 ANSWER_DISCLAIMER_RE = re.compile(
     r"(?i)\b("
     r"the text does not (?:specify|mention)|"
@@ -255,6 +285,10 @@ def get_expansion_factor(lang_code: str) -> float:
     return DEFAULT_EXPANSION_FACTOR
 
 
+def is_ruler_niah_profile(translation_profile: str | None) -> bool:
+    return (translation_profile or "").strip().lower() == TRANSLATION_PROFILE_RULER_NIAH
+
+
 def calculate_safe_input_tokens(target_lang: str) -> int:
     expansion_factor = get_expansion_factor(target_lang)
     available_budget = QWEN_CONTEXT_WINDOW_TOKENS - QWEN_SAFETY_BUFFER_TOKENS - PROMPT_OVERHEAD_TOKENS
@@ -267,18 +301,62 @@ def calculate_safe_chunk_size(target_lang: str) -> int:
     return max(1, int(safe_input_tokens * CHUNK_INPUT_FRACTION))
 
 
+def apply_chunk_size_profile(safe_chunk_tokens: int, translation_profile: str) -> int:
+    if is_ruler_niah_profile(translation_profile):
+        return max(1, int(safe_chunk_tokens * NIAH_CHUNK_INPUT_SCALE))
+    return safe_chunk_tokens
+
+
 def calculate_remaining_budget_tokens(text: str) -> int:
     input_tokens = estimate_tokens(text)
     available_budget = QWEN_CONTEXT_WINDOW_TOKENS - QWEN_SAFETY_BUFFER_TOKENS - PROMPT_OVERHEAD_TOKENS
     return max(1, int(available_budget - input_tokens))
 
 
-def calculate_auto_max_output_tokens(text: str, target_lang: str) -> int:
+def calculate_remaining_budget_tokens_from_input_tokens(input_tokens: int) -> int:
+    return max(1, int(QWEN_CONTEXT_WINDOW_TOKENS - QWEN_SAFETY_BUFFER_TOKENS - input_tokens))
+
+
+def estimate_chat_request_input_tokens(system_prompt: str, user_prompt: str) -> int:
+    return (
+        estimate_tokens(system_prompt)
+        + estimate_tokens(user_prompt)
+        + CHAT_COMPLETION_MESSAGE_WRAPPER_TOKENS
+    )
+
+
+def extract_vllm_allowed_max_tokens(error_text: str) -> int | None:
+    match = VLLM_MAX_TOKENS_TOO_LARGE_RE.search(error_text)
+    if not match:
+        return None
+    try:
+        context_tokens = int(match.group("context"))
+        input_tokens = int(match.group("input"))
+    except (TypeError, ValueError):
+        return None
+    allowed = context_tokens - input_tokens
+    if allowed <= 0:
+        return None
+    return allowed
+
+
+def calculate_auto_max_output_tokens(
+    text: str,
+    target_lang: str,
+    translation_profile: str = TRANSLATION_PROFILE_DEFAULT,
+) -> int:
     input_tokens = estimate_tokens(text)
     expansion_factor = get_expansion_factor(target_lang)
     remaining_budget_tokens = calculate_remaining_budget_tokens(text)
-    expansion_scaled_tokens = max(1, int(input_tokens * expansion_factor * AUTO_MAX_OUTPUT_MARGIN))
-    return min(remaining_budget_tokens, max(expansion_scaled_tokens, MIN_OUTPUT_TOKENS))
+    output_margin = NIAH_AUTO_MAX_OUTPUT_MARGIN if is_ruler_niah_profile(translation_profile) else AUTO_MAX_OUTPUT_MARGIN
+    expansion_scaled_tokens = max(1, int(input_tokens * expansion_factor * output_margin))
+    budget_floor = MIN_OUTPUT_TOKENS
+    if input_tokens >= 8 and input_tokens <= SHORT_INPUT_OUTPUT_BUDGET_MAX_TOKENS:
+        budget_floor = max(
+            SHORT_INPUT_MIN_OUTPUT_TOKENS,
+            int(input_tokens * SHORT_INPUT_OUTPUT_MULTIPLIER),
+        )
+    return min(remaining_budget_tokens, max(expansion_scaled_tokens, budget_floor))
 
 
 def is_output_too_short(input_text: str, output_text: str) -> bool:
@@ -349,7 +427,29 @@ def is_output_structurally_incomplete(input_text: str, output_text: str) -> bool
     return False
 
 
-def is_output_pathologically_repetitive(output_text: str) -> bool:
+def is_output_pathologically_repetitive(
+    output_text: str,
+    *,
+    ignore_tail_unique_ratio_check: bool = False,
+) -> bool:
+    longest_char_run = 1
+    current_char_run = 1
+    previous_char: str | None = None
+    for char in output_text:
+        if char.isspace():
+            previous_char = None
+            current_char_run = 1
+            continue
+        if previous_char is not None and char == previous_char:
+            current_char_run += 1
+        else:
+            current_char_run = 1
+        if current_char_run > longest_char_run:
+            longest_char_run = current_char_run
+            if longest_char_run >= REPETITION_MAX_IDENTICAL_CHAR_RUN:
+                return True
+        previous_char = char
+
     if estimate_tokens(output_text) < REPETITION_MIN_OUTPUT_TOKENS:
         return False
 
@@ -365,6 +465,9 @@ def is_output_pathologically_repetitive(output_text: str) -> bool:
                 return True
         else:
             current_run = 1
+
+    if ignore_tail_unique_ratio_check:
+        return False
 
     tail_window_size = min(REPETITION_TAIL_WINDOW_WORDS, len(words))
     tail_words = words[-tail_window_size:]
@@ -473,13 +576,18 @@ def validate_translation_output(
     max_output_tokens: int,
     finish_reason: str | None,
     target_language: str,
+    translation_profile: str = TRANSLATION_PROFILE_DEFAULT,
 ) -> str | None:
     if not output_text:
         return "empty output"
 
     normalized_finish_reason = (finish_reason or "").strip().lower()
+    ignore_tail_unique_ratio_check = is_ruler_niah_profile(translation_profile)
     if normalized_finish_reason == "length":
-        if is_output_pathologically_repetitive(output_text):
+        if is_output_pathologically_repetitive(
+            output_text,
+            ignore_tail_unique_ratio_check=ignore_tail_unique_ratio_check,
+        ):
             return "output became repetitive and hit max_tokens"
         return "output hit max_tokens before completion"
     if normalized_finish_reason not in ALLOWED_FINISH_REASONS:
@@ -489,7 +597,10 @@ def validate_translation_output(
     if is_output_too_short(input_text, output_text):
         return "output too short for input length"
     if is_output_likely_truncated(output_text, max_output_tokens):
-        if is_output_pathologically_repetitive(output_text):
+        if is_output_pathologically_repetitive(
+            output_text,
+            ignore_tail_unique_ratio_check=ignore_tail_unique_ratio_check,
+        ):
             return "output likely clipped near max_tokens with repetitive degeneration"
         return "output likely clipped near max_tokens"
     if is_output_structurally_incomplete(input_text, output_text):
@@ -612,7 +723,7 @@ def create_translation_prompt(text: str, target_language: str) -> str:
     )
 
 
-def chunk_text(text: str, max_chunk_tokens: int = 10000) -> list[str]:
+def _chunk_text_by_paragraphs(text: str, max_chunk_tokens: int = 10000) -> list[str]:
     paragraphs = text.split("\n")
     chunks = []
     current_chunk = []
@@ -653,6 +764,48 @@ def chunk_text(text: str, max_chunk_tokens: int = 10000) -> list[str]:
     return chunks if chunks else [text]
 
 
+def _chunk_text_by_document_markers(text: str, max_chunk_tokens: int) -> list[str] | None:
+    document_blocks = [block for block in re.split(r"(?im)(?=^\s*Document\s+\d{1,4}\s*:)", text) if block.strip()]
+    if len(document_blocks) < 3:
+        return None
+
+    chunks: list[str] = []
+    current_blocks: list[str] = []
+    current_tokens = 0
+
+    for block in document_blocks:
+        block_tokens = estimate_tokens(block)
+        if block_tokens > max_chunk_tokens:
+            if current_blocks:
+                chunks.append("".join(current_blocks))
+                current_blocks = []
+                current_tokens = 0
+            # Fall back for oversized individual document blocks.
+            chunks.extend(_chunk_text_by_paragraphs(block, max_chunk_tokens=max_chunk_tokens))
+            continue
+
+        if current_blocks and current_tokens + block_tokens > max_chunk_tokens:
+            chunks.append("".join(current_blocks))
+            current_blocks = [block]
+            current_tokens = block_tokens
+            continue
+
+        current_blocks.append(block)
+        current_tokens += block_tokens
+
+    if current_blocks:
+        chunks.append("".join(current_blocks))
+
+    return chunks if chunks else None
+
+
+def chunk_text(text: str, max_chunk_tokens: int = 10000) -> list[str]:
+    marker_chunks = _chunk_text_by_document_markers(text, max_chunk_tokens=max_chunk_tokens)
+    if marker_chunks:
+        return marker_chunks
+    return _chunk_text_by_paragraphs(text, max_chunk_tokens=max_chunk_tokens)
+
+
 def estimate_tokens(text: str) -> int:
     if not text:
         return 0
@@ -673,6 +826,7 @@ async def translate_chunk(
     presence_penalty: float,
     enable_thinking: bool,
     retry_count: int,
+    translation_profile: str = TRANSLATION_PROFILE_DEFAULT,
 ) -> tuple[str | None, str | None, dict[str, Any] | None]:
     system_prompt = create_translation_system_prompt(target_language)
     prompt = create_translation_prompt(text, target_language)
@@ -686,10 +840,10 @@ async def translate_chunk(
         "- Preserve marker labels like \"Document 12:\" / \"Passage 7:\".\n"
         "- Do not repeat words or paragraphs."
     )
-    max_budget_tokens = max(max_output_tokens, calculate_remaining_budget_tokens(text))
     failure_reason: str | None = None
     attempt_summaries: list[dict[str, Any]] = []
     last_rejected_output: str | None = None
+    server_max_tokens_cap: int | None = None
 
     for attempt in range(retry_count):
         attempt_system_prompt = system_prompt
@@ -699,10 +853,13 @@ async def translate_chunk(
             attempt_system_prompt = f"{system_prompt}{strict_suffix}"
             attempt_temperature = min(temperature, STRICT_RETRY_TEMPERATURE)
             growth_factor = 1.0 + (RETRY_MAX_TOKENS_GROWTH_STEP * attempt)
-            attempt_max_tokens = min(
-                max_budget_tokens,
-                max(max_output_tokens, int(max_output_tokens * growth_factor)),
-            )
+            attempt_max_tokens = max(max_output_tokens, int(max_output_tokens * growth_factor))
+        estimated_request_input_tokens = estimate_chat_request_input_tokens(attempt_system_prompt, prompt)
+        estimated_request_budget_cap = calculate_remaining_budget_tokens_from_input_tokens(estimated_request_input_tokens)
+        effective_budget_cap = estimated_request_budget_cap
+        if server_max_tokens_cap is not None:
+            effective_budget_cap = min(effective_budget_cap, server_max_tokens_cap)
+        attempt_max_tokens = max(MIN_OUTPUT_TOKENS, min(attempt_max_tokens, effective_budget_cap))
         try:
             payload = {
                 "messages": [
@@ -731,6 +888,7 @@ async def translate_chunk(
                 attempt_max_tokens,
                 finish_reason,
                 target_language,
+                translation_profile,
             )
             if invalid_reason is not None:
                 failure_reason = invalid_reason
@@ -750,6 +908,13 @@ async def translate_chunk(
                 raise RuntimeError(f"Translation output rejected ({invalid_reason}); retrying.")
             return translated, None, None
         except Exception as exc:
+            skip_backoff = False
+            allowed_max_tokens = extract_vllm_allowed_max_tokens(str(exc))
+            if allowed_max_tokens is not None:
+                reduced_cap = max(MIN_OUTPUT_TOKENS, allowed_max_tokens - SERVER_MAX_TOKENS_RETRY_MARGIN)
+                if server_max_tokens_cap is None or reduced_cap < server_max_tokens_cap:
+                    server_max_tokens_cap = reduced_cap
+                skip_backoff = True
             if failure_reason is None:
                 failure_reason = str(exc)
             if not attempt_summaries or attempt_summaries[-1].get("attempt") != attempt + 1:
@@ -761,9 +926,13 @@ async def translate_chunk(
                         "error": str(exc),
                     }
                 )
+            if allowed_max_tokens is not None:
+                attempt_summaries[-1]["server_allowed_max_tokens"] = allowed_max_tokens
+                attempt_summaries[-1]["server_retry_cap"] = server_max_tokens_cap
             if attempt < retry_count - 1:
                 logger.debug("Translation attempt %d/%d failed: %s", attempt + 1, retry_count, exc)
-                await asyncio.sleep(2**attempt)
+                if not skip_backoff:
+                    await asyncio.sleep(2**attempt)
             else:
                 logger.warning("Translation failed after %d attempt(s): %s", retry_count, exc)
 
@@ -787,79 +956,88 @@ async def translate_text(
     presence_penalty: float,
     enable_thinking: bool,
     retry_count: int,
+    translation_profile: str = TRANSLATION_PROFILE_DEFAULT,
 ) -> tuple[str, bool, str | None, dict[str, Any] | None]:
     if not text or not text.strip():
         return text, False, None, None
 
     safe_input_tokens = calculate_safe_input_tokens(target_language)
-    safe_chunk_tokens = calculate_safe_chunk_size(target_language)
+    safe_chunk_tokens = apply_chunk_size_profile(
+        calculate_safe_chunk_size(target_language),
+        translation_profile,
+    )
 
     estimated_tokens = estimate_tokens(text)
-    if estimated_tokens > safe_input_tokens:
-        async def _translate_chunks(
-            chunk_tokens: int,
-            chunk_temperature: float,
-        ) -> tuple[str, bool, set[str], list[dict[str, Any]]]:
-            chunks = chunk_text(text, max_chunk_tokens=chunk_tokens)
-            tasks = [
-                translate_chunk(
-                    chunk,
-                    generate,
-                    target_language,
-                    calculate_auto_max_output_tokens(chunk, target_language),
-                    chunk_temperature,
-                    top_p,
-                    top_k,
-                    min_p,
-                    presence_penalty,
-                    enable_thinking,
-                    retry_count,
+    async def _translate_chunks(
+        chunk_tokens: int,
+        chunk_temperature: float,
+    ) -> tuple[str, bool, set[str], list[dict[str, Any]]]:
+        chunks = chunk_text(text, max_chunk_tokens=chunk_tokens)
+        tasks = [
+            translate_chunk(
+                chunk,
+                generate,
+                target_language,
+                calculate_auto_max_output_tokens(chunk, target_language, translation_profile),
+                chunk_temperature,
+                top_p,
+                top_k,
+                min_p,
+                presence_penalty,
+                enable_thinking,
+                retry_count,
+                translation_profile,
+            )
+            for chunk in chunks
+        ]
+        results = await asyncio.gather(*tasks)
+        translated_chunks = []
+        failed = False
+        failure_reasons: set[str] = set()
+        failed_chunk_details: list[dict[str, Any]] = []
+        for chunk_index, (chunk, (translated, reason, failure_debug)) in enumerate(zip(chunks, results)):
+            if translated is None:
+                failed = True
+                if reason:
+                    failure_reasons.add(reason)
+                failed_chunk_details.append(
+                    {
+                        "chunk_index": chunk_index,
+                        "chunk_input_tokens": estimate_tokens(chunk),
+                        "chunk_input_chars": len(chunk),
+                        "chunk_preview_start": chunk[:MAX_FAILURE_PREVIEW_CHARS],
+                        "chunk_preview_end": (
+                            chunk[-MAX_FAILURE_PREVIEW_CHARS:]
+                            if len(chunk) > MAX_FAILURE_PREVIEW_CHARS
+                            else chunk
+                        ),
+                        "failure_reason": reason,
+                        "failure_debug": failure_debug,
+                    }
                 )
-                for chunk in chunks
-            ]
-            results = await asyncio.gather(*tasks)
-            translated_chunks = []
-            failed = False
-            failure_reasons: set[str] = set()
-            failed_chunk_details: list[dict[str, Any]] = []
-            for chunk_index, (chunk, (translated, reason, failure_debug)) in enumerate(zip(chunks, results)):
-                if translated is None:
-                    failed = True
-                    if reason:
-                        failure_reasons.add(reason)
-                    failed_chunk_details.append(
-                        {
-                            "chunk_index": chunk_index,
-                            "chunk_input_tokens": estimate_tokens(chunk),
-                            "chunk_input_chars": len(chunk),
-                            "chunk_preview_start": chunk[:MAX_FAILURE_PREVIEW_CHARS],
-                            "chunk_preview_end": (
-                                chunk[-MAX_FAILURE_PREVIEW_CHARS:]
-                                if len(chunk) > MAX_FAILURE_PREVIEW_CHARS
-                                else chunk
-                            ),
-                            "failure_reason": reason,
-                            "failure_debug": failure_debug,
-                        }
-                    )
-                    translated_chunks.append(chunk)
-                else:
-                    translated_chunks.append(translated)
-            return "\n".join(translated_chunks), failed, failure_reasons, failed_chunk_details
+                translated_chunks.append(chunk)
+            else:
+                translated_chunks.append(translated)
+        return "\n".join(translated_chunks), failed, failure_reasons, failed_chunk_details
 
+    async def _translate_with_chunk_retries(
+        base_chunk_tokens: int,
+        *,
+        debug_context: str,
+    ) -> tuple[str, bool, str | None, dict[str, Any] | None]:
         strict_temperature = min(temperature, STRICT_RETRY_TEMPERATURE)
         retry_stages: list[dict[str, Any]] = [
             {
                 "stage": "initial",
-                "chunk_tokens": safe_chunk_tokens,
+                "chunk_tokens": base_chunk_tokens,
                 "temperature": temperature,
                 "requires_reason_match": False,
             }
         ]
 
-        strict_chunk_tokens = max(1, int(safe_chunk_tokens * STRICT_CHUNK_INPUT_FRACTION))
-        seen_chunk_sizes = {safe_chunk_tokens}
-        if strict_chunk_tokens < safe_chunk_tokens and strict_chunk_tokens not in seen_chunk_sizes:
+        strict_chunk_tokens = max(1, int(base_chunk_tokens * STRICT_CHUNK_INPUT_FRACTION))
+        seen_chunk_sizes = {base_chunk_tokens}
+        if strict_chunk_tokens < base_chunk_tokens and strict_chunk_tokens not in seen_chunk_sizes:
             retry_stages.append(
                 {
                     "stage": "strict",
@@ -871,8 +1049,8 @@ async def translate_text(
             seen_chunk_sizes.add(strict_chunk_tokens)
 
         for idx, fraction in enumerate(AGGRESSIVE_CHUNK_INPUT_FRACTIONS, start=1):
-            aggressive_chunk_tokens = max(1, int(safe_chunk_tokens * fraction))
-            if aggressive_chunk_tokens >= safe_chunk_tokens or aggressive_chunk_tokens in seen_chunk_sizes:
+            aggressive_chunk_tokens = max(1, int(base_chunk_tokens * fraction))
+            if aggressive_chunk_tokens >= base_chunk_tokens or aggressive_chunk_tokens in seen_chunk_sizes:
                 continue
             retry_stages.append(
                 {
@@ -910,14 +1088,16 @@ async def translate_text(
 
         reason_text = "; ".join(sorted(failure_reasons)) if failure_reasons else "chunked translation failed"
         logger.warning(
-            "Chunked translation failed after retries (%s); returning original source text to avoid partial output.",
+            "Chunked translation failed after retries (%s, %s); returning original source text to avoid partial output.",
             reason_text,
+            debug_context,
         )
         failure_debug = {
             "mode": "chunked",
+            "debug_context": debug_context,
             "input_tokens": estimated_tokens,
             "safe_input_tokens": safe_input_tokens,
-            "safe_chunk_tokens": safe_chunk_tokens,
+            "safe_chunk_tokens": base_chunk_tokens,
             "retry_stages": stage_debug,
             "final_failure_reason": reason_text,
         }
@@ -933,7 +1113,13 @@ async def translate_text(
                     break
         return text, True, reason_text, failure_debug
 
-    max_output_tokens = calculate_auto_max_output_tokens(text, target_language)
+    if estimated_tokens > safe_input_tokens:
+        return await _translate_with_chunk_retries(
+            safe_chunk_tokens,
+            debug_context="chunked_threshold_exceeded",
+        )
+
+    max_output_tokens = calculate_auto_max_output_tokens(text, target_language, translation_profile)
     translated, failure_reason, chunk_failure_debug = await translate_chunk(
         text,
         generate,
@@ -946,13 +1132,43 @@ async def translate_text(
         presence_penalty,
         enable_thinking,
         retry_count,
+        translation_profile,
     )
     if translated is None:
+        rescue_failure_debug: dict[str, Any] | None = None
+        if (
+            estimated_tokens >= SINGLE_MODE_RESCUE_MIN_INPUT_TOKENS
+            and failure_reason
+            and should_retry_with_smaller_chunks({failure_reason})
+        ):
+            rescue_chunk_tokens = min(
+                safe_chunk_tokens,
+                max(
+                    SINGLE_MODE_RESCUE_MIN_CHUNK_TOKENS,
+                    int(estimated_tokens * SINGLE_MODE_RESCUE_CHUNK_FRACTION),
+                ),
+            )
+            if rescue_chunk_tokens < estimated_tokens:
+                logger.info(
+                    "Single-pass translation failed (%s); retrying with chunked fallback at %d tokens.",
+                    failure_reason,
+                    rescue_chunk_tokens,
+                )
+                rescue_translated, rescue_failed, rescue_reason, rescue_failure_debug = await _translate_with_chunk_retries(
+                    rescue_chunk_tokens,
+                    debug_context="single_mode_rescue",
+                )
+                if not rescue_failed:
+                    return rescue_translated, False, None, None
+                failure_reason = rescue_reason or failure_reason
+
         failure_debug = {
             "mode": "single",
             "input_tokens": estimated_tokens,
             "failure_debug": chunk_failure_debug,
         }
+        if rescue_failure_debug is not None:
+            failure_debug["single_mode_chunk_rescue"] = rescue_failure_debug
         return text, True, failure_reason or "translation failed", failure_debug
     return translated, False, None, None
 
@@ -968,6 +1184,7 @@ async def _translate_single_value(
     presence_penalty: float,
     enable_thinking: bool,
     retry_count: int,
+    translation_profile: str = TRANSLATION_PROFILE_DEFAULT,
 ) -> tuple[Any, bool, str | None, dict[str, Any] | None]:
     """Translate a single value (string or list of strings) in parallel."""
     if isinstance(value, list):
@@ -989,6 +1206,7 @@ async def _translate_single_value(
                         presence_penalty,
                         enable_thinking,
                         retry_count,
+                        translation_profile,
                     )
                 )
 
@@ -1029,6 +1247,7 @@ async def _translate_single_value(
             presence_penalty,
             enable_thinking,
             retry_count,
+            translation_profile,
         )
     else:
         return value, False, None, None
@@ -1051,6 +1270,7 @@ async def translate_fields(
     include_source_language: bool,
     include_lang_fields: bool,
     include_failed: bool,
+    translation_profile: str = TRANSLATION_PROFILE_DEFAULT,
 ) -> dict[str, Any]:
     row = document.metadata.get("row")
     if not isinstance(row, dict):
@@ -1083,6 +1303,7 @@ async def translate_fields(
                 presence_penalty,
                 enable_thinking,
                 retry_count,
+                translation_profile,
             )
             for _, value in fields_to_process
         ]
@@ -1362,6 +1583,117 @@ def collect_existing_row_ids(output_dir: Path) -> set[str]:
     return row_ids
 
 
+def load_jsonl_rows_by_id(output_dir: Path) -> dict[str, dict[str, Any]]:
+    files = sorted(output_dir.glob("*.jsonl*"))
+    if not files:
+        raise FileNotFoundError(f"No JSONL outputs found in {output_dir}")
+    rows_by_id: dict[str, dict[str, Any]] = {}
+    for path in files:
+        opener = gzip.open if path.suffix == ".gz" else open
+        with opener(path, "rt", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                row_id = get_row_id(row)
+                if row_id is None:
+                    raise RuntimeError(f"Missing row id in retry output row from {path}")
+                row_id = str(row_id)
+                if row_id in rows_by_id:
+                    raise RuntimeError(f"Duplicate row id {row_id} found in retry outputs at {output_dir}")
+                rows_by_id[row_id] = row
+    return rows_by_id
+
+
+def merge_retry_outputs_into_existing(
+    output_dir: Path,
+    retry_output_dir: Path,
+    expected_retry_ids: set[str],
+) -> None:
+    if not retry_output_dir.exists():
+        raise FileNotFoundError(f"Retry output directory does not exist: {retry_output_dir}")
+
+    source_files = sorted(output_dir.glob("*.jsonl*"))
+    if not source_files:
+        raise FileNotFoundError(f"No base output files found to merge into: {output_dir}")
+
+    retry_rows_by_id = load_jsonl_rows_by_id(retry_output_dir)
+    expected_ids = {str(row_id) for row_id in expected_retry_ids}
+    retry_ids = set(retry_rows_by_id.keys())
+
+    missing_retry_rows = expected_ids - retry_ids
+    if missing_retry_rows:
+        preview = sorted(missing_retry_rows)[:5]
+        raise RuntimeError(
+            f"Retry output missing {len(missing_retry_rows)} expected row(s) (examples: {preview})"
+        )
+
+    unexpected_retry_rows = retry_ids - expected_ids
+    if unexpected_retry_rows:
+        preview = sorted(unexpected_retry_rows)[:5]
+        progress_logger.warning(
+            "Retry output contains %d unexpected row(s); they will be ignored during merge (examples: %s)",
+            len(unexpected_retry_rows),
+            preview,
+        )
+
+    replaced_ids: set[str] = set()
+    total_rows = 0
+    replaced_rows = 0
+
+    # Place the temporary merge files on the same filesystem when possible to
+    # keep the final replacement atomic and avoid EXDEV on /tmp -> NFS moves.
+    with tempfile.TemporaryDirectory(prefix="datatrove_retry_merge_", dir=output_dir) as tmp_dir:
+        tmp_root = Path(tmp_dir)
+        for src_path in source_files:
+            dst_path = tmp_root / src_path.name
+            read_opener = gzip.open if src_path.suffix == ".gz" else open
+            write_opener = gzip.open if dst_path.suffix == ".gz" else open
+            with read_opener(src_path, "rt", encoding="utf-8") as src_handle:
+                with write_opener(dst_path, "wt", encoding="utf-8") as dst_handle:
+                    for line in src_handle:
+                        if not line.strip():
+                            continue
+                        row = json.loads(line)
+                        total_rows += 1
+                        row_id = get_row_id(row)
+                        if row_id is not None:
+                            row_id_str = str(row_id)
+                            replacement = retry_rows_by_id.get(row_id_str)
+                            if replacement is not None:
+                                row = replacement
+                                replaced_ids.add(row_id_str)
+                                replaced_rows += 1
+                        dst_handle.write(json.dumps(row, ensure_ascii=False))
+                        dst_handle.write("\n")
+
+        not_found_in_base = expected_ids - replaced_ids
+        if not_found_in_base:
+            preview = sorted(not_found_in_base)[:5]
+            raise RuntimeError(
+                f"Could not find {len(not_found_in_base)} retried row(s) in base outputs for merge (examples: {preview})"
+            )
+
+        for src_path in source_files:
+            staged_path = tmp_root / src_path.name
+            try:
+                staged_path.replace(src_path)
+            except OSError as exc:
+                if exc.errno != errno.EXDEV:
+                    raise
+                # Cross-device fallback for environments where the temp dir is
+                # still on a different filesystem.
+                shutil.move(str(staged_path), str(src_path))
+
+    progress_logger.info(
+        "Retry merge complete: replaced %d row(s) across %d file(s) in %s (total rows scanned: %d)",
+        replaced_rows,
+        len(source_files),
+        output_dir,
+        total_rows,
+    )
+
+
 def write_upload_normalized_jsonl(src_path: Path, dst_path: Path, drop_columns: set[str]) -> None:
     """Write a normalized copy for HF upload to avoid schema drift across rows/chunks."""
     read_opener = gzip.open if src_path.suffix == ".gz" else open
@@ -1560,9 +1892,16 @@ def run_datatrove_translation(
     progress_interval: int,
     progress_label: str,
     retry_ids: set[str] | None,
+    translation_profile: str,
     save_failed_attempts: bool,
     failed_attempts_filename: str,
 ) -> None:
+    if retry_ids is not None and clean_output:
+        progress_logger.warning(
+            "Retry mode requested with clean_output enabled; ignoring clean_output to preserve base outputs for merge."
+        )
+        clean_output = False
+
     if clean_output:
         progress_logger.info("Clean output enabled; removing prior outputs for %s", output_dir)
         shutil.rmtree(output_dir, ignore_errors=True)
@@ -1573,10 +1912,25 @@ def run_datatrove_translation(
     logging_dir.mkdir(parents=True, exist_ok=True)
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
+    retry_output_dir: Path | None = None
+    writer_output_dir = output_dir
+    if retry_ids is not None:
+        retry_output_dir = output_dir / "__retry_tmp__"
+        shutil.rmtree(retry_output_dir, ignore_errors=True)
+        retry_output_dir.mkdir(parents=True, exist_ok=True)
+        writer_output_dir = retry_output_dir
+        progress_logger.info(
+            "Retry mode: writing retry rows to temporary output dir %s before merging into %s",
+            retry_output_dir,
+            output_dir,
+        )
+
     failed_attempts_path = logging_dir / failed_attempts_filename if save_failed_attempts else None
     configure_failed_translation_artifact(failed_attempts_path)
     if failed_attempts_path is not None:
         progress_logger.info("Saving failed translation attempts to %s", failed_attempts_path)
+    if translation_profile != TRANSLATION_PROFILE_DEFAULT:
+        progress_logger.info("Using translation profile: %s", translation_profile)
 
     existing_output_files = sorted(output_dir.glob("*.jsonl*"))
     checkpoint_files = [path for path in checkpoints_dir.rglob("*") if path.is_file()]
@@ -1621,7 +1975,7 @@ def run_datatrove_translation(
 
     if language == "en":
         output_writer = ProgressJsonlWriter(
-            output_folder=str(output_dir),
+            output_folder=str(writer_output_dir),
             output_filename="${rank}.jsonl",
             compression="gzip",
             adapter=output_adapter,
@@ -1655,12 +2009,15 @@ def run_datatrove_translation(
             logging_dir=str(logging_dir),
             skip_completed=skip_completed,
         )
+        completed = False
         try:
             executor.run()
+            completed = True
         except OSError as exc:
             if not handle_checkpoint_cleanup_error(exc, checkpoints_dir):
                 raise
             progress_logger.info("Translation completed (checkpoint cleanup had a non-fatal error)")
+            completed = True
         finally:
             # Clean up any leftover checkpoint files that may cause issues on NFS
             if checkpoints_dir.exists():
@@ -1668,13 +2025,16 @@ def run_datatrove_translation(
                     shutil.rmtree(checkpoints_dir, ignore_errors=True)
                 except Exception:
                     pass
+        if completed and retry_output_dir is not None:
+            merge_retry_outputs_into_existing(output_dir, retry_output_dir, retry_ids)
+            shutil.rmtree(retry_output_dir, ignore_errors=True)
         return
 
     if not model_name:
         raise ValueError("model_name must be set for non-English translation jobs")
 
     output_writer = ProgressJsonlWriter(
-        output_folder=str(output_dir),
+        output_folder=str(writer_output_dir),
         output_filename="${rank}_chunk_${chunk_index}.jsonl",
         compression="gzip",
         adapter=output_adapter,
@@ -1717,6 +2077,7 @@ def run_datatrove_translation(
         include_source_language=include_source_language,
         include_lang_fields=include_lang_fields,
         include_failed=include_failed,
+        translation_profile=translation_profile,
     )
 
     pipeline = [reader]
@@ -1741,12 +2102,15 @@ def run_datatrove_translation(
         logging_dir=str(logging_dir),
         skip_completed=skip_completed,
     )
+    completed = False
     try:
         executor.run()
+        completed = True
     except OSError as exc:
         if not handle_checkpoint_cleanup_error(exc, checkpoints_dir):
             raise
         progress_logger.info("Translation completed (checkpoint cleanup had a non-fatal error)")
+        completed = True
     finally:
         # Clean up any leftover checkpoint files that may cause issues on NFS
         if checkpoints_dir.exists():
@@ -1754,6 +2118,9 @@ def run_datatrove_translation(
                 shutil.rmtree(checkpoints_dir, ignore_errors=True)
             except Exception:
                 pass
+    if completed and retry_output_dir is not None:
+        merge_retry_outputs_into_existing(output_dir, retry_output_dir, retry_ids)
+        shutil.rmtree(retry_output_dir, ignore_errors=True)
 
 
 def load_output_dataset(output_dir: Path):
@@ -1790,13 +2157,33 @@ def upload_to_hub(
     dataset = load_output_dataset(output_dir)
     if save_to_disk:
         dataset.save_to_disk(str(output_dir / "hf_dataset"))
-    dataset.push_to_hub(
-        hf_repo,
-        config_name=config_name,
-        split=split_name,
-        token=hf_token,
-        private=False,
-    )
+    for attempt in range(HF_UPLOAD_RETRY_COUNT):
+        try:
+            dataset.push_to_hub(
+                hf_repo,
+                config_name=config_name,
+                split=split_name,
+                token=hf_token,
+                private=False,
+            )
+            return
+        except Exception as exc:
+            error_text = str(exc).casefold()
+            is_transient = any(marker in error_text for marker in HF_UPLOAD_TRANSIENT_ERROR_SUBSTRINGS)
+            if attempt >= HF_UPLOAD_RETRY_COUNT - 1 or not is_transient:
+                raise
+            delay_seconds = HF_UPLOAD_RETRY_BASE_DELAY_SECONDS * (2**attempt)
+            logger.warning(
+                "HF upload failed for %s/%s (%s) with transient error; retrying in %ds (%d/%d): %s",
+                hf_repo,
+                config_name,
+                split_name,
+                delay_seconds,
+                attempt + 1,
+                HF_UPLOAD_RETRY_COUNT,
+                exc,
+            )
+            time.sleep(delay_seconds)
 
 
 def parse_comma_list(value: str) -> list[str]:
@@ -2011,6 +2398,7 @@ def main() -> int:
                 progress_interval=args.progress_interval,
                 progress_label=config_name,
                 retry_ids=retry_ids,
+                translation_profile=TRANSLATION_PROFILE_DEFAULT,
                 save_failed_attempts=args.save_failed_attempts,
                 failed_attempts_filename=args.failed_attempts_filename,
             )
@@ -2091,6 +2479,11 @@ def main() -> int:
                 progress_interval=args.progress_interval,
                 progress_label=config_name,
                 retry_ids=retry_ids,
+                translation_profile=(
+                    TRANSLATION_PROFILE_RULER_NIAH
+                    if split.startswith("niah")
+                    else TRANSLATION_PROFILE_DEFAULT
+                ),
                 save_failed_attempts=args.save_failed_attempts,
                 failed_attempts_filename=args.failed_attempts_filename,
             )

@@ -159,6 +159,7 @@ OUTPUT_MODE_SUFFIX = "suffix"
 OUTPUT_MODE_REPLACE = "replace"
 TRANSLATION_PROFILE_DEFAULT = "default"
 TRANSLATION_PROFILE_RULER_NIAH = "ruler_niah"
+TRANSLATION_PROFILE_RULER_QA = "ruler_qa"
 
 ROW_ID_KEYS = ("id", "_id", "qid", "doc_id", "task_id", "uuid", "index")
 
@@ -270,6 +271,17 @@ QA_GUARD_MAX_OUTPUT_TOKENS = 120
 QA_GUARD_MIN_INPUT_LINES = 6
 QA_GUARD_MAX_OUTPUT_LINE_RATIO = 0.35
 QA_GUARD_MIN_MARKERS = 3
+RULER_QA_INSTRUCTION_TEXT = (
+    "Answer the question based on the given documents. "
+    "Only give me the answer and do not output any other words."
+)
+RULER_QA_QUESTION_LABEL = "Question:"
+RULER_QA_ANSWER_LABEL = "Answer:"
+RULER_NIAH_INTRO_PREFIX = "A special magic number is hidden within the following text."
+RULER_NIAH_QUESTION_PREFIX = "What is the special magic number for "
+RULER_NIAH_QUESTION_SUFFIX = " mentioned in the provided text is"
+RULER_NIAH_MIN_BODY_LINES = 64
+DIGIT_SEQUENCE_RE = re.compile(r"\d+")
 
 
 def get_expansion_factor(lang_code: str) -> float:
@@ -287,6 +299,10 @@ def get_expansion_factor(lang_code: str) -> float:
 
 def is_ruler_niah_profile(translation_profile: str | None) -> bool:
     return (translation_profile or "").strip().lower() == TRANSLATION_PROFILE_RULER_NIAH
+
+
+def is_ruler_qa_profile(translation_profile: str | None) -> bool:
+    return (translation_profile or "").strip().lower() == TRANSLATION_PROFILE_RULER_QA
 
 
 def calculate_safe_input_tokens(target_lang: str) -> int:
@@ -482,6 +498,103 @@ def has_embedded_qa_directive(text: str) -> bool:
         or "answer the question" in lowered
         or "only give me the answer" in lowered
     )
+
+
+def split_outer_whitespace(text: str) -> tuple[str, str, str]:
+    start = 0
+    end = len(text)
+    while start < end and text[start].isspace():
+        start += 1
+    while end > start and text[end - 1].isspace():
+        end -= 1
+    return text[:start], text[start:end], text[end:]
+
+
+def is_numeric_only_text(text: str) -> bool:
+    stripped = text.strip()
+    return bool(stripped) and stripped.isdigit()
+
+
+def are_digit_sequences_preserved(source_text: str, translated_text: str) -> bool:
+    source_digit_sequences = DIGIT_SEQUENCE_RE.findall(source_text)
+    if not source_digit_sequences:
+        return True
+    return all(seq in translated_text for seq in source_digit_sequences)
+
+
+def extract_ruler_qa_input_parts(text: str) -> dict[str, str] | None:
+    if not text:
+        return None
+
+    instruction = RULER_QA_INSTRUCTION_TEXT
+    tail_instruction_idx = text.rfind(instruction)
+    if tail_instruction_idx < 0:
+        return None
+
+    question_idx = text.find(RULER_QA_QUESTION_LABEL, tail_instruction_idx + len(instruction))
+    if question_idx < 0:
+        return None
+
+    answer_idx = text.rfind(RULER_QA_ANSWER_LABEL)
+    if answer_idx < 0 or answer_idx <= question_idx:
+        return None
+
+    # We only support the canonical RULER QA layout where the text ends at the
+    # answer label (plus optional whitespace).
+    if text[answer_idx + len(RULER_QA_ANSWER_LABEL):].strip():
+        return None
+
+    has_head_instruction = text.startswith(instruction)
+    head_instruction = instruction if has_head_instruction else ""
+    body_start = len(instruction) if has_head_instruction else 0
+    if tail_instruction_idx < body_start:
+        return None
+
+    return {
+        "head_instruction": head_instruction,
+        "body": text[body_start:tail_instruction_idx],
+        "tail_instruction": instruction,
+        "between_tail_instruction_and_question": text[tail_instruction_idx + len(instruction):question_idx],
+        "question_label": text[question_idx:question_idx + len(RULER_QA_QUESTION_LABEL)],
+        "question_text": text[question_idx + len(RULER_QA_QUESTION_LABEL):answer_idx],
+        "answer_label_and_suffix": text[answer_idx:],
+    }
+
+
+def extract_ruler_niah_input_parts(text: str) -> dict[str, Any] | None:
+    if not text:
+        return None
+
+    lines = text.splitlines()
+    if len(lines) < (RULER_NIAH_MIN_BODY_LINES + 2):
+        return None
+
+    intro_line = lines[0]
+    question_line = lines[-1]
+    body_lines = lines[1:-1]
+
+    if not intro_line.startswith(RULER_NIAH_INTRO_PREFIX):
+        return None
+    if not question_line.startswith(RULER_NIAH_QUESTION_PREFIX):
+        return None
+    if not question_line.endswith(RULER_NIAH_QUESTION_SUFFIX):
+        return None
+    if not body_lines:
+        return None
+
+    unique_body_lines = set(body_lines)
+    # niah_single_1 is highly repetitive with a hidden needle line embedded inside.
+    # Keep the parser conservative so it only triggers on the intended layout.
+    if len(unique_body_lines) > 8:
+        return None
+
+    return {
+        "intro_line": intro_line,
+        "body_lines": body_lines,
+        "question_line": question_line,
+        "line_count": len(lines),
+        "body_unique_line_count": len(unique_body_lines),
+    }
 
 
 def is_output_likely_embedded_qa_answer(input_text: str, output_text: str) -> bool:
@@ -1173,6 +1286,207 @@ async def translate_text(
     return translated, False, None, None
 
 
+async def translate_ruler_qa_input(
+    text: str,
+    generate,
+    target_language: str,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    min_p: float,
+    presence_penalty: float,
+    enable_thinking: bool,
+    retry_count: int,
+    translation_profile: str,
+) -> tuple[str, bool, str | None, dict[str, Any] | None]:
+    parts = extract_ruler_qa_input_parts(text)
+    if parts is None:
+        return await translate_text(
+            text,
+            generate,
+            target_language,
+            temperature,
+            top_p,
+            top_k,
+            min_p,
+            presence_penalty,
+            enable_thinking,
+            retry_count,
+            translation_profile,
+        )
+
+    part_failures: dict[str, str] = {}
+    part_debug: dict[str, Any] = {"mode": "ruler_qa_split"}
+
+    async def _translate_part(part_name: str, part_text: str) -> str | None:
+        translated, failed, failure_reason, failure_debug = await translate_text(
+            part_text,
+            generate,
+            target_language,
+            temperature,
+            top_p,
+            top_k,
+            min_p,
+            presence_penalty,
+            enable_thinking,
+            retry_count,
+            translation_profile,
+        )
+        if failed:
+            part_failures[part_name] = failure_reason or "translation failed"
+            if failure_debug is not None:
+                part_debug.setdefault("parts", {})[part_name] = failure_debug
+            return None
+        return translated
+
+    translated_instruction_core: str | None = None
+    instruction_core = parts["tail_instruction"]
+    if instruction_core.strip():
+        translated_instruction_core = await _translate_part("qa_instruction", instruction_core)
+        if translated_instruction_core is None:
+            reason_text = "; ".join(f"{k}: {v}" for k, v in sorted(part_failures.items()))
+            return text, True, reason_text, part_debug
+    else:
+        translated_instruction_core = instruction_core
+
+    translated_body = parts["body"]
+    if parts["body"].strip():
+        translated_body_value = await _translate_part("documents_body", parts["body"])
+        if translated_body_value is None:
+            reason_text = "; ".join(f"{k}: {v}" for k, v in sorted(part_failures.items()))
+            return text, True, reason_text, part_debug
+        translated_body = translated_body_value
+
+    translated_question_text = parts["question_text"]
+    question_lead_ws, question_core, question_trail_ws = split_outer_whitespace(parts["question_text"])
+    if question_core:
+        translated_question_core = await _translate_part("question_text", question_core)
+        if translated_question_core is None:
+            reason_text = "; ".join(f"{k}: {v}" for k, v in sorted(part_failures.items()))
+            return text, True, reason_text, part_debug
+        translated_question_text = f"{question_lead_ws}{translated_question_core}{question_trail_ws}"
+
+    translated_text = (
+        (translated_instruction_core if parts["head_instruction"] else "")
+        + translated_body
+        + (translated_instruction_core or parts["tail_instruction"])
+        + parts["between_tail_instruction_and_question"]
+        + parts["question_label"]
+        + translated_question_text
+        + parts["answer_label_and_suffix"]
+    )
+    part_debug["split_applied"] = True
+    return translated_text, False, None, part_debug
+
+
+async def translate_ruler_niah_input(
+    text: str,
+    generate,
+    target_language: str,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    min_p: float,
+    presence_penalty: float,
+    enable_thinking: bool,
+    retry_count: int,
+    translation_profile: str,
+) -> tuple[str, bool, str | None, dict[str, Any] | None]:
+    parts = extract_ruler_niah_input_parts(text)
+    if parts is None:
+        return await translate_text(
+            text,
+            generate,
+            target_language,
+            temperature,
+            top_p,
+            top_k,
+            min_p,
+            presence_penalty,
+            enable_thinking,
+            retry_count,
+            translation_profile,
+        )
+
+    part_temperature = min(temperature, STRICT_RETRY_TEMPERATURE)
+    part_failures: dict[str, str] = {}
+    part_debug: dict[str, Any] = {
+        "mode": "ruler_niah_line_cached",
+        "body_line_count": len(parts["body_lines"]),
+        "body_unique_line_count": parts["body_unique_line_count"],
+    }
+
+    async def _translate_line(line_name: str, line_text: str) -> str | None:
+        translated, failed, failure_reason, failure_debug = await translate_text(
+            line_text,
+            generate,
+            target_language,
+            part_temperature,
+            top_p,
+            top_k,
+            min_p,
+            presence_penalty,
+            enable_thinking,
+            retry_count,
+            translation_profile,
+        )
+        if failed:
+            part_failures[line_name] = failure_reason or "translation failed"
+            if failure_debug is not None:
+                part_debug.setdefault("parts", {})[line_name] = failure_debug
+            return None
+        if not are_digit_sequences_preserved(line_text, translated):
+            part_failures[line_name] = "digit sequence changed or missing in translated output"
+            part_debug.setdefault("parts", {})[line_name] = {
+                "source_preview": line_text[:MAX_FAILURE_PREVIEW_CHARS],
+                "translated_preview": translated[:MAX_FAILURE_PREVIEW_CHARS],
+            }
+            return None
+        return translated
+
+    translated_intro = await _translate_line("intro_line", parts["intro_line"])
+    if translated_intro is None:
+        reason_text = "; ".join(f"{k}: {v}" for k, v in sorted(part_failures.items()))
+        return text, True, reason_text, part_debug
+
+    translated_question = await _translate_line("question_line", parts["question_line"])
+    if translated_question is None:
+        reason_text = "; ".join(f"{k}: {v}" for k, v in sorted(part_failures.items()))
+        return text, True, reason_text, part_debug
+
+    translated_line_cache: dict[str, str] = {}
+    unique_nonempty_body_lines: list[str] = []
+    for line in parts["body_lines"]:
+        if not line.strip():
+            continue
+        if line in translated_line_cache:
+            continue
+        translated_line_cache[line] = ""
+        unique_nonempty_body_lines.append(line)
+
+    # Translate each unique body line once, then reconstruct the exact original order.
+    # This preserves the hidden needle line while avoiding huge repetitive chunks.
+    for line_idx, line in enumerate(unique_nonempty_body_lines):
+        line_name = f"body_line_{line_idx}"
+        if DIGIT_SEQUENCE_RE.search(line):
+            line_name = f"{line_name}_with_digits"
+        translated_line = await _translate_line(line_name, line)
+        if translated_line is None:
+            reason_text = "; ".join(f"{k}: {v}" for k, v in sorted(part_failures.items()))
+            return text, True, reason_text, part_debug
+        translated_line_cache[line] = translated_line
+
+    translated_body_lines = [
+        translated_line_cache.get(line, line) if line.strip() else line
+        for line in parts["body_lines"]
+    ]
+
+    translated_text = "\n".join([translated_intro, *translated_body_lines, translated_question])
+    part_debug["split_applied"] = True
+    part_debug["cached_body_lines"] = len(unique_nonempty_body_lines)
+    return translated_text, False, None, part_debug
+
+
 async def _translate_single_value(
     value: str | list | Any,
     generate,
@@ -1185,6 +1499,7 @@ async def _translate_single_value(
     enable_thinking: bool,
     retry_count: int,
     translation_profile: str = TRANSLATION_PROFILE_DEFAULT,
+    field_name: str | None = None,
 ) -> tuple[Any, bool, str | None, dict[str, Any] | None]:
     """Translate a single value (string or list of strings) in parallel."""
     if isinstance(value, list):
@@ -1193,6 +1508,8 @@ async def _translate_single_value(
         indices = []
         for i, item in enumerate(value):
             if isinstance(item, str) and item.strip():
+                if is_numeric_only_text(item):
+                    continue
                 indices.append(i)
                 tasks.append(
                     translate_text(
@@ -1236,6 +1553,36 @@ async def _translate_single_value(
         return translated_list, failed, reason_text, details
 
     elif isinstance(value, str):
+        if is_numeric_only_text(value):
+            return value, False, None, None
+        if is_ruler_niah_profile(translation_profile) and field_name == "input":
+            return await translate_ruler_niah_input(
+                value,
+                generate,
+                target_language,
+                temperature,
+                top_p,
+                top_k,
+                min_p,
+                presence_penalty,
+                enable_thinking,
+                retry_count,
+                translation_profile,
+            )
+        if is_ruler_qa_profile(translation_profile) and field_name == "input":
+            return await translate_ruler_qa_input(
+                value,
+                generate,
+                target_language,
+                temperature,
+                top_p,
+                top_k,
+                min_p,
+                presence_penalty,
+                enable_thinking,
+                retry_count,
+                translation_profile,
+            )
         return await translate_text(
             value,
             generate,
@@ -1304,8 +1651,9 @@ async def translate_fields(
                 enable_thinking,
                 retry_count,
                 translation_profile,
+                field,
             )
-            for _, value in fields_to_process
+            for field, value in fields_to_process
         ]
         results = await asyncio.gather(*tasks)
 
@@ -2482,6 +2830,8 @@ def main() -> int:
                 translation_profile=(
                     TRANSLATION_PROFILE_RULER_NIAH
                     if split.startswith("niah")
+                    else TRANSLATION_PROFILE_RULER_QA
+                    if split.startswith("qa_")
                     else TRANSLATION_PROFILE_DEFAULT
                 ),
                 save_failed_attempts=args.save_failed_attempts,

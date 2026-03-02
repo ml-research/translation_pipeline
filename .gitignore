@@ -1,53 +1,23 @@
-# Python-generated files
+# Ignore everything by default, then whitelist only translation/validation code.
+*
+
+# Allow directory traversal so nested whitelist rules work.
+!*/
+
+# Keep this file.
+!.gitignore
+
+# Keep top-level translation/validation project files.
+!README.md
+!pyproject.toml
+!uv.lock
+!translate_datatrove.py
+!validate_datatrove_output.py
+
+# Keep the refactored translation pipeline package.
+!translation_pipeline/
+!translation_pipeline/**
+
+# Still ignore Python cache artifacts even inside whitelisted paths.
 __pycache__/
 *.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
-
-# Virtual environments
-.venv
-
-# Local tool/config files (machine-specific)
-.claude/
-.direnv/
-.envrc
-.python-version
-CLAUDE.md
-
-# Logs / cluster outputs
-logs/
-*.log
-*.out
-*.err
-
-# Datatrove generated artifacts (data, checkpoints, outputs)
-datatrove_inputs/
-datatrove_checkpoints*/
-datatrove_outputs*/
-failed_samples/
-hf_cache/
-
-# Temp / scratch
-tmp/
-tmp.txt
-*.tmp
-
-# Notebook/editor runtime artifacts
-.ipynb_checkpoints/
-*.ipynb
-
-# Local planning notes
-TODO.md
-
-# Slurm / cluster submission scripts (contain secrets/env details)
-*.sbatch
-submit_*.sh
-
-# Python test/cache artifacts
-.pytest_cache/
-.mypy_cache/
-
-# OS cruft
-.DS_Store

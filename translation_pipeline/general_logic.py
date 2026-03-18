@@ -40,11 +40,14 @@ from .ruler_logic import (
     DEFAULT_RULER_SPLITS,
     DIGIT_SEQUENCE_RE,
     RULER_FIELDS,
+    RULER_QA_ANSWER_LABEL,
+    RULER_QA_QUESTION_LABEL,
     TRANSLATION_PROFILE_RULER_NIAH,
     TRANSLATION_PROFILE_RULER_QA,
     are_digit_sequences_preserved,
     extract_ruler_niah_input_parts,
     extract_ruler_qa_input_parts,
+    get_ruler_qa_label_translation,
     is_numeric_only_text,
     is_ruler_niah_profile,
     is_ruler_qa_profile,
@@ -83,6 +86,7 @@ FAILED_ATTEMPTS_FILENAME = "failed_translation_attempts.jsonl"
 MAX_FAILURE_PREVIEW_CHARS = 500
 FAILED_TRANSLATION_ARTIFACT_PATH: Path | None = None
 FAILED_TRANSLATION_ARTIFACT_LOCK: asyncio.Lock | None = None
+RULER_QA_LABEL_CACHE: dict[tuple[str, str], str] = {}
 UPLOAD_DROP_COLUMNS = {"_translation_failure_reasons"}
 
 
@@ -1214,6 +1218,23 @@ async def translate_ruler_qa_input(
             return None
         return translated
 
+    async def _translate_qa_label(english_label: str, part_name: str) -> str | None:
+        cache_key = (target_language.lower(), english_label)
+        cached_label = RULER_QA_LABEL_CACHE.get(cache_key)
+        if cached_label is not None:
+            return cached_label
+
+        mapped_label = get_ruler_qa_label_translation(target_language, english_label)
+        if mapped_label is not None:
+            RULER_QA_LABEL_CACHE[cache_key] = mapped_label
+            return mapped_label
+
+        translated_label = await _translate_part(part_name, english_label)
+        if translated_label is None:
+            return None
+        RULER_QA_LABEL_CACHE[cache_key] = translated_label
+        return translated_label
+
     translated_instruction_core: str | None = None
     instruction_core = parts["tail_instruction"]
     if instruction_core.strip():
@@ -1241,14 +1262,39 @@ async def translate_ruler_qa_input(
             return text, True, reason_text, part_debug
         translated_question_text = f"{question_lead_ws}{translated_question_core}{question_trail_ws}"
 
+    translated_question_label = parts["question_label"]
+    if parts["question_label"] == RULER_QA_QUESTION_LABEL:
+        translated_question_label_value = await _translate_qa_label(
+            RULER_QA_QUESTION_LABEL,
+            "question_label",
+        )
+        if translated_question_label_value is None:
+            reason_text = "; ".join(f"{k}: {v}" for k, v in sorted(part_failures.items()))
+            return text, True, reason_text, part_debug
+        translated_question_label = translated_question_label_value
+
+    translated_answer_label_and_suffix = parts["answer_label_and_suffix"]
+    if parts["answer_label_and_suffix"].startswith(RULER_QA_ANSWER_LABEL):
+        translated_answer_label_value = await _translate_qa_label(
+            RULER_QA_ANSWER_LABEL,
+            "answer_label",
+        )
+        if translated_answer_label_value is None:
+            reason_text = "; ".join(f"{k}: {v}" for k, v in sorted(part_failures.items()))
+            return text, True, reason_text, part_debug
+        translated_answer_label_and_suffix = (
+            translated_answer_label_value
+            + parts["answer_label_and_suffix"][len(RULER_QA_ANSWER_LABEL):]
+        )
+
     translated_text = (
         (translated_instruction_core if parts["head_instruction"] else "")
         + translated_body
         + (translated_instruction_core or parts["tail_instruction"])
         + parts["between_tail_instruction_and_question"]
-        + parts["question_label"]
+        + translated_question_label
         + translated_question_text
-        + parts["answer_label_and_suffix"]
+        + translated_answer_label_and_suffix
     )
     part_debug["split_applied"] = True
     return translated_text, False, None, part_debug

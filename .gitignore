@@ -4,6 +4,9 @@
 # Allow directory traversal so nested whitelist rules work.
 !*/
 
+# Keep local one-off repair scripts out of the repo.
+local_scripts/
+
 # Keep this file.
 !.gitignore
 

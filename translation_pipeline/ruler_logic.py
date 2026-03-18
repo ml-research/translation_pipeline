@@ -18,6 +18,40 @@ RULER_QA_INSTRUCTION_TEXT = (
 )
 RULER_QA_QUESTION_LABEL = "Question:"
 RULER_QA_ANSWER_LABEL = "Answer:"
+RULER_QA_LABEL_TRANSLATIONS = {
+    "en": {
+        RULER_QA_QUESTION_LABEL: RULER_QA_QUESTION_LABEL,
+        RULER_QA_ANSWER_LABEL: RULER_QA_ANSWER_LABEL,
+    },
+    "de": {
+        RULER_QA_QUESTION_LABEL: "Frage:",
+        RULER_QA_ANSWER_LABEL: "Antwort:",
+    },
+    "es": {
+        RULER_QA_QUESTION_LABEL: "Pregunta:",
+        RULER_QA_ANSWER_LABEL: "Respuesta:",
+    },
+    "fr": {
+        RULER_QA_QUESTION_LABEL: "Question:",
+        RULER_QA_ANSWER_LABEL: "Reponse:",
+    },
+    "it": {
+        RULER_QA_QUESTION_LABEL: "Domanda:",
+        RULER_QA_ANSWER_LABEL: "Risposta:",
+    },
+    "pt": {
+        RULER_QA_QUESTION_LABEL: "Pergunta:",
+        RULER_QA_ANSWER_LABEL: "Resposta:",
+    },
+    "pl": {
+        RULER_QA_QUESTION_LABEL: "Pytanie:",
+        RULER_QA_ANSWER_LABEL: "Odpowiedz:",
+    },
+    "nl": {
+        RULER_QA_QUESTION_LABEL: "Vraag:",
+        RULER_QA_ANSWER_LABEL: "Antwoord:",
+    },
+}
 RULER_NIAH_INTRO_PREFIX = "A special magic number is hidden within the following text."
 RULER_NIAH_QUESTION_PREFIX = "What is the special magic number for "
 RULER_NIAH_QUESTION_SUFFIX = " mentioned in the provided text is"
@@ -31,6 +65,10 @@ def is_ruler_niah_profile(translation_profile: str | None) -> bool:
 
 def is_ruler_qa_profile(translation_profile: str | None) -> bool:
     return (translation_profile or "").strip().lower() == TRANSLATION_PROFILE_RULER_QA
+
+
+def get_ruler_qa_label_translation(target_language: str, english_label: str) -> str | None:
+    return RULER_QA_LABEL_TRANSLATIONS.get(target_language.lower(), {}).get(english_label)
 
 
 def split_outer_whitespace(text: str) -> tuple[str, str, str]:
